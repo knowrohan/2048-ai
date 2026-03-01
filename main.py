@@ -1,3 +1,9 @@
+"""
+Entry point for the 2048 AI project.
+Parses command-line arguments to launch the application in either
+'play', 'watch', or 'train' modes.
+References `training.train`, `engine.game`, `ui.game_ui`, and `ai.model`.
+"""
 import argparse
 import torch
 import os
@@ -31,14 +37,18 @@ def main():
                 
             model = ZeroNet().to(device)
             if os.path.exists(args.checkpoint):
-                model.load_state_dict(torch.load(args.checkpoint, map_location=device))
+                checkpoint = torch.load(args.checkpoint, map_location=device)
+                if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+                    model.load_state_dict(checkpoint['model_state_dict'])
+                else:
+                    model.load_state_dict(checkpoint)
                 print(f"Loaded valid checkpoint: {args.checkpoint}")
             else:
                 print(f"Warning: Checkpoint {args.checkpoint} not found. Proceeding with uninitialized untrained model.")
                 
             model.eval()
             print("Watching the AI play using MCTS...")
-            ui.play_ai(model)
+            ui.play_ai(model, num_simulations=400)
 
 if __name__ == '__main__':
     main()

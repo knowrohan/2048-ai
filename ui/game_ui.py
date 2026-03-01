@@ -1,3 +1,9 @@
+"""
+Pygame-based graphical user interface for the 2048 game.
+Handles rendering the game board, colors, tiles, and listening to user inputs.
+Provides both human play and AI play (watch) visualization modes.
+References `ai.mcts.MCTS` when AI plays.
+"""
 import pygame
 import sys
 import numpy as np
@@ -18,7 +24,11 @@ TILE_COLORS = {
     256: (237, 204, 97),
     512: (237, 200, 80),
     1024: (237, 197, 63),
-    2048: (237, 194, 46)
+    2048: (237, 194, 46),
+    4096: (60, 58, 50),
+    8192: (57, 55, 47),
+    16384: (54, 52, 44),
+    32768: (51, 49, 41),
 }
 
 TEXT_COLORS = {
@@ -96,13 +106,27 @@ class GameUI:
                         return
             clock.tick(30)
             
-        print(f"Game Over! Final Score: {self.engine.score}")
-        pygame.time.wait(2000)
-        pygame.quit()
+        highest_tile = np.max(self.engine.grid)
+        print("\n--- Game Over ---")
+        print(f"Total Moves: {getattr(self.engine, 'moves', 0)}")
+        print(f"Final Score: {self.engine.score}")
+        print(f"Highest Tile: {highest_tile}")
+        print("\nGame frozen. Close the window to exit.")
 
-    def play_ai(self, model, c_puct=1.5, num_simulations=50, delay=0.5):
+        while True:
+            self.draw()
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT or (event.type == pygame.KEYDOWN and event.key == pygame.K_q):
+                    pygame.quit()
+                    return
+            pygame.time.Clock().tick(30)
+
+    def play_ai(self, model, c_puct=1.5, num_simulations=400, delay=0.3):
         from ai.mcts import MCTS
-        mcts = MCTS(model, c_puct=c_puct, num_simulations=num_simulations)
+        import torch
+        import torch.nn.functional as F
+        device = next(model.parameters()).device
+        mcts = MCTS(c_puct=c_puct)
         clock = pygame.time.Clock()
         
         while not self.engine.game_over:
@@ -113,7 +137,22 @@ class GameUI:
                     return
             
             # AI Move choice
-            action_probs = mcts.search(self.engine)
+            root = mcts.search_root(self.engine, model, device)
+            
+            for _ in range(num_simulations):
+                search_path, leaf_game = mcts.search_leaf(self.engine, root)
+                if leaf_game.game_over:
+                    mcts.backpropagate_leaf(search_path, leaf_game, -1.0, None)
+                else:
+                    state_tensor = torch.from_numpy(MCTS.encode_state(leaf_game._flat_grid)).unsqueeze(0).to(device)
+                    with torch.no_grad():
+                        p_logits, v_out = model(state_tensor)
+                    p_out = F.softmax(p_logits, dim=1).cpu().numpy()[0]
+                    v_out = v_out.cpu().numpy()[0][0]
+                    mcts.backpropagate_leaf(search_path, leaf_game, v_out, p_out)
+            
+            action_probs = mcts.get_action_prob(root, temperature=0.0)
+            
             if action_probs:
                 # Deterministic move selection for evaluation
                 best_action = max(action_probs, key=action_probs.get)
@@ -124,6 +163,17 @@ class GameUI:
             time.sleep(delay)
             clock.tick(30)
             
-        print(f"Game Over! Final Score: {self.engine.score}")
-        pygame.time.wait(2000)
-        pygame.quit()
+        highest_tile = np.max(self.engine.grid)
+        print("\n--- Game Over ---")
+        print(f"Total Moves: {getattr(self.engine, 'moves', 0)}")
+        print(f"Final Score: {self.engine.score}")
+        print(f"Highest Tile: {highest_tile}")
+        print("\nGame frozen. Close the window to exit.")
+
+        while True:
+            self.draw()
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT or (event.type == pygame.KEYDOWN and event.key == pygame.K_q):
+                    pygame.quit()
+                    return
+            pygame.time.Clock().tick(30)

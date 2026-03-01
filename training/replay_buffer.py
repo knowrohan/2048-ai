@@ -1,8 +1,13 @@
+"""
+Experience replay buffer for storing self-play game data.
+Stores states, policies, and values, and allows sampling batches for training.
+"""
 import random
 import torch
+import numpy as np
 
 class ReplayBuffer:
-    def __init__(self, capacity=10000):
+    def __init__(self, capacity=100000):
         self.capacity = capacity
         self.buffer = []
         self.position = 0
@@ -17,7 +22,11 @@ class ReplayBuffer:
         batch = random.sample(self.buffer, batch_size)
         states, policies, values = zip(*batch)
         # Convert values to float32 explicitly before converting to tensor
-        return torch.stack(states), torch.tensor(policies, dtype=torch.float32), torch.tensor(values, dtype=torch.float32).unsqueeze(1)
+        return (
+            torch.stack(states),
+            torch.from_numpy(np.array(policies, dtype=np.float32)),
+            torch.from_numpy(np.array(values, dtype=np.float32)).unsqueeze(1)
+        )
 
     def __len__(self):
         return len(self.buffer)
