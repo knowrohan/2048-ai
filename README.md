@@ -1,3 +1,19 @@
+
+Activate the environment context (source .venv/bin/activate).
+
+To play the game manually:
+
+python main.py --mode play
+To watch the untrained network attempt the game using raw MCTS rollouts:
+
+python main.py --mode watch
+To run the self-play training loop (saves to checkpoints/latest.pth automatically):
+
+python main.py --mode train
+
+
+
+
 # 2048-ai
 ### System Architecture Pipeline
 

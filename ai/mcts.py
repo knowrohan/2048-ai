@@ -44,16 +44,39 @@ class MCTS:
         Transform 2048 grid into a one-hot encoding across tile powers.
         Output shape: (NUM_TILE_CHANNELS, 4, 4) unbatched
         """
-        flat = grid.flatten() if hasattr(grid, 'flatten') else grid
+        flat = np.asarray(grid, dtype=np.int64).ravel()
         one_hot = np.zeros((NUM_TILE_CHANNELS, 16), dtype=np.float32)
-        for i, val in enumerate(flat):
-            if val == 0:
-                one_hot[0, i] = 1.0
-            else:
-                power = int(val).bit_length() - 1
-                if power < NUM_TILE_CHANNELS:
-                    one_hot[power, i] = 1.0
+        nonzero_mask = flat > 0
+        # Empty cells map to channel 0
+        one_hot[0, ~nonzero_mask] = 1.0
+        # Nonzero cells: compute power of 2 and use as channel index
+        powers = np.zeros(16, dtype=np.int64)
+        powers[nonzero_mask] = np.log2(flat[nonzero_mask]).astype(np.int64)
+        valid = powers < NUM_TILE_CHANNELS
+        indices = np.where(nonzero_mask & valid)[0]
+        one_hot[powers[indices], indices] = 1.0
         return one_hot.reshape((NUM_TILE_CHANNELS, 4, 4))
+
+    @staticmethod
+    def encode_states_batch(grids):
+        """
+        Vectorized batch encoding of multiple grids at once.
+        grids: list of flat grids (each a list/array of 16 ints)
+        Output shape: (batch, NUM_TILE_CHANNELS, 4, 4)
+        """
+        n = len(grids)
+        flat = np.array(grids, dtype=np.int64).reshape(n, 16)
+        one_hot = np.zeros((n, NUM_TILE_CHANNELS, 16), dtype=np.float32)
+        nonzero_mask = flat > 0
+        # Empty cells -> channel 0
+        one_hot[:, 0, :][~nonzero_mask] = 1.0
+        # Nonzero cells: compute power of 2
+        powers = np.zeros_like(flat)
+        powers[nonzero_mask] = np.log2(flat[nonzero_mask]).astype(np.int64)
+        valid = nonzero_mask & (powers < NUM_TILE_CHANNELS)
+        batch_idx, cell_idx = np.where(valid)
+        one_hot[batch_idx, powers[batch_idx, cell_idx], cell_idx] = 1.0
+        return one_hot.reshape((n, NUM_TILE_CHANNELS, 4, 4))
 
     def search_root(self, game, model, device):
         """

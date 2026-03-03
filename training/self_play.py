@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 import math
+import time
 from ai.mcts import MCTS
 from engine.game import GameEngine
 
@@ -32,18 +33,36 @@ def apply_flip(grid, policy):
     flipped_policy = [policy[FLIP_LR_ACTION[i]] for i in range(4)]
     return flipped_grid, flipped_policy
 
-def augment_data(grids, policies):
-    """Apply 8-fold symmetry augmentation (4 rotations x 2 reflections)."""
+def augment_data(grids, policies, augment_factor=8):
+    """
+    Apply symmetry augmentation.
+    augment_factor=8: full 8-fold (4 rotations x 2 reflections)
+    augment_factor=2: light (original + 1 rotation)
+    augment_factor=1: no augmentation
+    """
     aug_grids = []
     aug_policies = []
     for grid, policy in zip(grids, policies):
-        for k in range(4):
-            rg, rp = apply_rotation(grid, policy, k)
+        if augment_factor >= 8:
+            # Full 8-fold
+            for k in range(4):
+                rg, rp = apply_rotation(grid, policy, k)
+                aug_grids.append(rg.copy())
+                aug_policies.append(rp)
+                fg, fp = apply_flip(rg, rp)
+                aug_grids.append(fg.copy())
+                aug_policies.append(fp)
+        elif augment_factor >= 2:
+            # Light: original + 180° rotation
+            aug_grids.append(grid.copy())
+            aug_policies.append(policy)
+            rg, rp = apply_rotation(grid, policy, 2)
             aug_grids.append(rg.copy())
             aug_policies.append(rp)
-            fg, fp = apply_flip(rg, rp)
-            aug_grids.append(fg.copy())
-            aug_policies.append(fp)
+        else:
+            # No augmentation
+            aug_grids.append(grid.copy())
+            aug_policies.append(policy)
     return aug_grids, aug_policies
 
 def evaluate_board(grid):
@@ -81,8 +100,21 @@ def evaluate_board(grid):
     return (monotonic_score + empty_score) / 2.0
 
 
-def play_games_concurrently(model, target_games, num_concurrent=256, num_simulations=200, c_puct=1.5, temperature_moves=30):
+def play_games_concurrently(model, target_games, num_concurrent=256, num_simulations=200, c_puct=1.5, temperature_moves=30, augment_factor=8):
     device = next(model.parameters()).device
+
+    # Determine autocast device type for float16 inference
+    if device.type == 'cuda':
+        autocast_device = 'cuda'
+        use_autocast = True
+    elif device.type == 'mps':
+        # MPS autocast support is limited; skip to avoid issues
+        autocast_device = 'cpu'
+        use_autocast = False
+    else:
+        autocast_device = 'cpu'
+        use_autocast = False
+
     mcts = MCTS(c_puct=c_puct)
     
     # Initialize the concurrent track
@@ -94,19 +126,28 @@ def play_games_concurrently(model, target_games, num_concurrent=256, num_simulat
     histories = [{"raw_grids": [], "states": [], "policies": [], "moves": 0} for _ in range(num_concurrent)]
     
     completed_games = 0
+    total_score = 0
+    total_max_tile = 0
+    total_moves = 0
     
     all_final_states = []
     all_final_policies = []
     all_final_values = []
     
+    selfplay_start = time.time()
+    
     # We loop until we have finished exactly `target_games`
     while completed_games < target_games:
+        num_active = len(active_games)
+        
+        # Pre-allocate arrays for the simulation loop (reused each simulation step)
+        values_batch = np.zeros(num_active, dtype=np.float32)
         
         # MCTS simulation loops for all active games
         for _ in range(num_simulations):
             search_paths = []
             leaf_games = []
-            eval_states = []
+            eval_grids = []
             eval_indices = []
             
             # Phase 1: Selection to a leaf for each game
@@ -116,21 +157,27 @@ def play_games_concurrently(model, target_games, num_concurrent=256, num_simulat
                 leaf_games.append(leaf_game)
                 
                 if leaf_game.game_over:
-                    eval_states.append(None)
+                    eval_grids.append(None)
                 else:
-                    eval_states.append(MCTS.encode_state(leaf_game._flat_grid))
+                    eval_grids.append(leaf_game._flat_grid)
                     eval_indices.append(i)
                     
-            # Phase 2: Massive GPU evaluation
-            values_batch = np.zeros(num_concurrent, dtype=np.float32)
-            policies_batch = [None] * num_concurrent
+            # Phase 2: Batched GPU evaluation with batch encoding
+            values_batch[:] = 0.0
+            policies_batch = [None] * num_active
             
             if eval_indices:
-                tensors = [eval_states[idx] for idx in eval_indices]
-                batch_tensor = torch.from_numpy(np.stack(tensors)).to(device)
+                # Batch encode all leaf states at once
+                grids_to_encode = [eval_grids[idx] for idx in eval_indices]
+                batch_np = MCTS.encode_states_batch(grids_to_encode)
+                batch_tensor = torch.from_numpy(batch_np).to(device)
                 
                 with torch.no_grad():
-                    p_logits, v_out = model(batch_tensor)
+                    if use_autocast:
+                        with torch.autocast(device_type=autocast_device, dtype=torch.float16):
+                            p_logits, v_out = model(batch_tensor)
+                    else:
+                        p_logits, v_out = model(batch_tensor)
                     
                 p_out = F.softmax(p_logits, dim=1).cpu().numpy()
                 v_out = v_out.cpu().numpy()
@@ -140,16 +187,16 @@ def play_games_concurrently(model, target_games, num_concurrent=256, num_simulat
                     policies_batch[original_idx] = p_out[idx_in_batch]
                     
             # Special case for finished games at the leaf
-            for i in range(num_concurrent):
-                if eval_states[i] is None:
+            for i in range(len(active_games)):
+                if eval_grids[i] is None:
                     values_batch[i] = -1.0
                     
             # Phase 3: Backpropagation distribution
-            for i in range(num_concurrent):
+            for i in range(len(active_games)):
                 mcts.backpropagate_leaf(search_paths[i], leaf_games[i], values_batch[i], policies_batch[i])
 
         # After MCTS simulations, pick a move and advance all games
-        for i in range(num_concurrent):
+        for i in range(len(active_games)):
             game = active_games[i]
             root = roots[i]
             history = histories[i]
@@ -188,15 +235,21 @@ def play_games_concurrently(model, target_games, num_concurrent=256, num_simulat
                 
         # Handle finished games
         i = 0
-        while i < num_concurrent:
+        while i < len(active_games):
             game = active_games[i]
             if game.game_over:
                 max_tile = np.max(game.grid)
                 moves = histories[i]["moves"]
                 completed_games += 1
+                total_score += game.score
+                total_max_tile += max_tile
+                total_moves += moves
                 
-                if completed_games % 50 == 0 or completed_games == 1:
-                    print(f"Finished Game {completed_games}/{target_games} - Final Score: {game.score} - Max Tile: {max_tile} - Total Moves: {moves}")
+                elapsed = time.time() - selfplay_start
+                avg_score = total_score / completed_games
+                avg_tile = total_max_tile / completed_games
+                games_per_sec = completed_games / elapsed if elapsed > 0 else 0
+                print(f"  Game {completed_games:>4}/{target_games} │ Score: {game.score:>7} │ Max Tile: {max_tile:>5} │ Moves: {moves:>4} │ Avg Score: {avg_score:>7.0f} │ {games_per_sec:.2f} games/s")
 
                 # Calculate specific terminal values
                 SCORE_TARGET = 150000.0
@@ -215,7 +268,7 @@ def play_games_concurrently(model, target_games, num_concurrent=256, num_simulat
                     for t in range(n_states - 2, -1, -1):
                         values[t] = gamma * values[t + 1]
                         
-                aug_grids, aug_policies = augment_data(histories[i]["raw_grids"], histories[i]["policies"])
+                aug_grids, aug_policies = augment_data(histories[i]["raw_grids"], histories[i]["policies"], augment_factor=augment_factor)
                 
                 aug_states = []
                 for g in aug_grids:
@@ -223,14 +276,14 @@ def play_games_concurrently(model, target_games, num_concurrent=256, num_simulat
                     
                 aug_values = []
                 for v in values:
-                    aug_values.extend([v] * 8)
+                    aug_values.extend([v] * augment_factor)
                     
                 all_final_states.extend(aug_states)
                 all_final_policies.extend(aug_policies)
                 all_final_values.extend(aug_values)
                 
                 # Instantiate a new game in this slot to keep batch size constant, unless we are done
-                if completed_games + (num_concurrent - 1 - i) < target_games:
+                if completed_games + (len(active_games) - 1 - i) < target_games:
                     # We still need another game in this slot
                     active_games[i] = GameEngine()
                     roots[i] = mcts.search_root(active_games[i], model, device)
@@ -242,9 +295,16 @@ def play_games_concurrently(model, target_games, num_concurrent=256, num_simulat
                     active_games.pop(i)
                     roots.pop(i)
                     histories.pop(i)
-                    num_concurrent -= 1
                     # Do not increment i because elements shift left
             else:
                 i += 1
+    
+    # Self-play summary
+    total_time = time.time() - selfplay_start
+    avg_score = total_score / max(1, completed_games)
+    avg_tile = total_max_tile / max(1, completed_games)
+    avg_moves = total_moves / max(1, completed_games)
+    print(f"  Self-play complete: {completed_games} games in {total_time:.1f}s ({completed_games/max(0.1,total_time):.2f} games/s)")
+    print(f"  Avg Score: {avg_score:.0f} │ Avg Max Tile: {avg_tile:.0f} │ Avg Moves: {avg_moves:.0f} │ Samples: {len(all_final_states)}")
                 
     return all_final_states, all_final_policies, all_final_values
